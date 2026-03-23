@@ -1,0 +1,16 @@
+{
+  "name": "claw-manager",
+  "version": "1.0.0",
+  "description": "OpenClaw instance management dashboard",
+  "main": "server.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1",
+    "start": "node server.js"
+  },
+  "keywords": [],
+  "author": "ClawBack",
+  "license": "ISC",
+  "dependencies": {
+    "express": "^5.2.1"
+  }
+}
