@@ -1,45 +1,31 @@
 #!/usr/bin/env node
 // ============================================================
-// Claw Manager — OpenClaw instance management dashboard
+// Claw Manager — OpenClaw backup tool
 // Usage: node server.js [port]
+//        node server.js --backup <instance-id-or-name>
+//        node server.js --list-backups
 // Default port: 7788
 // ============================================================
 
 const express = require('express');
-const { execSync, exec, spawn } = require('child_process');
+const { exec } = require('child_process');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-const PORT = process.env.PORT || process.argv[2] || 7788;
+// ── CLI mode detection ────────────────────────────────────────
+const args = process.argv.slice(2);
+const CLI_MODE = args.includes('--backup') || args.includes('--list-backups');
+
+const PORT = process.env.PORT || (!CLI_MODE && args[0] && !args[0].startsWith('--') ? args[0] : 7788);
 const CLAW_MANAGER_TOKEN = process.env.CLAW_MANAGER_TOKEN || null;
 const INSTANCES_FILE = path.join(__dirname, 'instances.json');
 const SCRIPTS_DIR = path.join(os.homedir(), '.openclaw/workspace/scripts');
-const BACKUP_DIR = os.homedir();
+const BACKUP_DIR = path.join(os.homedir(), 'backups');
 const LOG_DIR = path.join(__dirname, 'logs');
 
 if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
-
-// In-memory cache for verification results, keyed by instance ID
-const verificationCache = new Map();
-
-const app = express();
-app.use(express.json());
-
-// ── Auth middleware ───────────────────────────────────────────
-if (!CLAW_MANAGER_TOKEN) {
-  console.warn('⚠️  CLAW_MANAGER_TOKEN not set — running in dev mode (no auth)');
-}
-
-app.use('/api', (req, res, next) => {
-  if (!CLAW_MANAGER_TOKEN) return next(); // dev mode — no token set
-  const auth = req.headers['authorization'] || '';
-  const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-  if (token !== CLAW_MANAGER_TOKEN) {
-    return res.status(401).json({ error: 'Unauthorized' });
-  }
-  next();
-});
+if (!fs.existsSync(BACKUP_DIR)) fs.mkdirSync(BACKUP_DIR, { recursive: true });
 
 // ── Helpers ──────────────────────────────────────────────────
 
@@ -53,8 +39,8 @@ function loadInstances() {
       throw new Error('instances.json is corrupt — refusing to silently return empty list. Fix or delete the file.');
     }
   } catch (readErr) {
-    if (readErr.code === 'ENOENT') return []; // file doesn't exist yet — that's fine
-    throw readErr; // re-throw corrupt JSON or other read errors
+    if (readErr.code === 'ENOENT') return [];
+    throw readErr;
   }
 }
 
@@ -98,7 +84,6 @@ function runAsync(cmd, logFile) {
     proc.stdout.on('data', d => { stdout += d; log.write(d); });
     proc.stderr.on('data', d => { stderr += d; log.write('[ERR] ' + d); });
 
-    // P0-3 FIX: handle spawn errors to avoid unhandled EventEmitter exceptions
     proc.on('error', err => {
       const msg = `[spawn error] ${err.message}\n`;
       stderr += msg;
@@ -115,362 +100,346 @@ function runAsync(cmd, logFile) {
   });
 }
 
-// ── API Routes ───────────────────────────────────────────────
+// ── CLI: --list-backups ───────────────────────────────────────
 
-// GET /api/instances — list all instances
-app.get('/api/instances', (req, res) => {
-  res.json(loadInstances());
-});
+async function cliListBackups() {
+  const files = fs.readdirSync(BACKUP_DIR)
+    .filter(f => f.endsWith('.tar.gz'))
+    .map(f => {
+      const full = path.join(BACKUP_DIR, f);
+      const stat = fs.statSync(full);
+      return { name: f, path: full, size: stat.size, mtime: stat.mtime };
+    })
+    .sort((a, b) => b.mtime - a.mtime);
 
-// POST /api/instances — add instance
-app.post('/api/instances', (req, res) => {
-  const instances = loadInstances();
-  const inst = { id: Date.now().toString(), ...req.body };
-  instances.push(inst);
-  saveInstances(instances);
-  res.json(inst);
-});
-
-// DELETE /api/instances/:id
-app.delete('/api/instances/:id', (req, res) => {
-  const instances = loadInstances().filter(i => i.id !== req.params.id);
-  saveInstances(instances);
-  res.json({ ok: true });
-});
-
-// GET /api/instances/:id/status — ping + check openclaw status
-app.get('/api/instances/:id/status', async (req, res) => {
-  const inst = loadInstances().find(i => i.id === req.params.id);
-  if (!inst) return res.status(404).json({ error: 'Not found' });
-
-  try {
-    const cmd = sshCmd(inst, 'openclaw status --json 2>/dev/null || openclaw status 2>&1 | head -20');
-    const result = await runAsync(cmd, path.join(LOG_DIR, `status_${inst.id}.log`));
-    res.json({ online: result.code === 0, output: result.stdout || result.stderr });
-  } catch (e) {
-    res.json({ online: false, output: e.message });
-  }
-});
-
-// GET /api/instances/:id/crons — list cron jobs
-app.get('/api/instances/:id/crons', async (req, res) => {
-  const inst = loadInstances().find(i => i.id === req.params.id);
-  if (!inst) return res.status(404).json({ error: 'Not found' });
-
-  const cmd = sshCmd(inst, 'openclaw cron list 2>&1');
-  const result = await runAsync(cmd, path.join(LOG_DIR, `crons_${inst.id}.log`));
-  res.json({ output: result.stdout || result.stderr });
-});
-
-// ── Verification helpers ─────────────────────────────────────
-
-async function runVerification(inst) {
-  const isLocal = inst.host === 'localhost' || inst.host === '127.0.0.1';
-  const home = inst.openclaw_state
-    ? inst.openclaw_state.replace(/\/.openclaw$/, '')
-    : `/home/${inst.user}`;
-  const workspace = `${home}/.openclaw/workspace`;
-
-  async function run(cmd) {
-    const fullCmd = isLocal ? cmd : sshCmd(inst, cmd);
-    return new Promise(resolve => {
-      exec(fullCmd, { shell: '/bin/bash', timeout: 15000 }, (err, stdout, stderr) => {
-        resolve({ code: err ? (err.code || 1) : 0, stdout: stdout || '', stderr: stderr || '' });
-      });
-    });
+  if (!files.length) {
+    console.log(`No backup archives found in ${BACKUP_DIR}`);
+    process.exit(0);
   }
 
-  const checks = [];
-
-  // 1. Workspace files
-  const wsFiles = ['MEMORY.md', 'SOUL.md', 'AGENTS.md', 'USER.md', 'CREDS.md', 'MACRO_BRIEF.md', 'HEARTBEAT.md', 'IDENTITY.md'];
-  for (const f of wsFiles) {
-    const r = await run(`test -f "${workspace}/${f}" && wc -c < "${workspace}/${f}" || echo MISSING`);
-    const out = r.stdout.trim();
-    if (out === 'MISSING' || r.code !== 0) {
-      checks.push({ name: `File: ${f}`, status: 'error', detail: 'Missing' });
-    } else {
-      const bytes = parseInt(out, 10);
-      if (bytes < 10) {
-        checks.push({ name: `File: ${f}`, status: 'warn', detail: `Present but tiny (${bytes} bytes)` });
-      } else {
-        checks.push({ name: `File: ${f}`, status: 'ok', detail: `${bytes} bytes` });
-      }
-    }
-  }
-
-  // 2. Scripts dir
-  const scriptsR = await run(`ls "${workspace}/scripts/"*.py 2>/dev/null | wc -l`);
-  const pyCount = parseInt(scriptsR.stdout.trim(), 10) || 0;
-  if (pyCount === 0) {
-    const dirR = await run(`test -d "${workspace}/scripts" && echo exists || echo missing`);
-    if (dirR.stdout.trim() === 'missing') {
-      checks.push({ name: 'Scripts dir', status: 'error', detail: 'scripts/ directory missing' });
-    } else {
-      checks.push({ name: 'Scripts dir', status: 'warn', detail: 'scripts/ exists but no .py files' });
-    }
-  } else {
-    checks.push({ name: 'Scripts dir', status: 'ok', detail: `${pyCount} .py files` });
-  }
-
-  // 3. Proton session
-  const protonR = await run(`test -f "${home}/.proton-session" && echo exists || echo missing`);
-  const protonExists = protonR.stdout.trim() === 'exists';
-  checks.push({ name: 'Proton session', status: protonExists ? 'ok' : 'warn', detail: protonExists ? 'Present' : '.proton-session not found' });
-
-  // 4. Cron jobs
-  const cronR = await run('openclaw cron list 2>&1');
-  const cronLines = cronR.stdout.split('\n').filter(l => l.match(/isolated|main/)).length;
-  if (cronLines === 0) {
-    checks.push({ name: 'Cron jobs', status: 'warn', detail: 'No cron jobs found' });
-  } else {
-    checks.push({ name: 'Cron jobs', status: 'ok', detail: `${cronLines} jobs configured` });
-  }
-
-  // 5. Gateway status
-  const gwR = await run('openclaw status 2>&1 | head -10');
-  const gwRunning = gwR.stdout.toLowerCase().includes('running') || gwR.code === 0;
-  checks.push({ name: 'Gateway', status: gwRunning ? 'ok' : 'error', detail: gwRunning ? 'Running' : 'Not running or unreachable' });
-
-  // 6. Telegram channel configured
-  const tgR = await run(`cat "${home}/.openclaw/openclaw.json" 2>/dev/null | python3 -c "import sys,json; d=json.load(sys.stdin); plugins=d.get('plugins',{}); entries=plugins.get('entries',{}); tg=[k for k,v in entries.items() if 'telegram' in k.lower() or (isinstance(v,dict) and 'telegram' in str(v).lower())]; print('found' if tg else 'none')" 2>/dev/null || echo none`);
-  const tgFound = tgR.stdout.trim() === 'found';
-  checks.push({ name: 'Telegram channel', status: tgFound ? 'ok' : 'warn', detail: tgFound ? 'Configured' : 'Not found in openclaw.json' });
-
-  const passing = checks.filter(c => c.status === 'ok').length;
-  const result = { instanceId: inst.id, instanceName: inst.name, checks, passing, total: checks.length, timestamp: new Date().toISOString() };
-  verificationCache.set(inst.id, result);
-  return result;
+  console.log(`\n📦 Backups in ${BACKUP_DIR}:\n`);
+  files.forEach(f => {
+    const sizeMB = (f.size / 1024 / 1024).toFixed(1);
+    const date = f.mtime.toLocaleString();
+    console.log(`  ${f.name}`);
+    console.log(`    Size: ${sizeMB} MB   Date: ${date}`);
+    console.log(`    Path: ${f.path}\n`);
+  });
+  process.exit(0);
 }
 
-// GET /api/instances/:id/verify
-app.get('/api/instances/:id/verify', async (req, res) => {
-  const inst = loadInstances().find(i => i.id === req.params.id);
-  if (!inst) return res.status(404).json({ error: 'Not found' });
-  try {
-    const result = await runVerification(inst);
-    res.json(result);
-  } catch (e) {
-    res.status(500).json({ error: e.message });
+// ── CLI: --backup <instance-id-or-name> ──────────────────────
+
+async function cliBackup(query) {
+  const instances = loadInstances();
+  const inst = instances.find(i => i.id === query || i.name.toLowerCase() === query.toLowerCase());
+  if (!inst) {
+    console.error(`❌ Instance not found: "${query}"`);
+    if (instances.length) {
+      console.error(`Available: ${instances.map(i => `${i.name} (id: ${i.id})`).join(', ')}`);
+    } else {
+      console.error('No instances configured. Add one via the web UI.');
+    }
+    process.exit(1);
   }
-});
 
-// GET /api/instances/:id/verify/cached
-app.get('/api/instances/:id/verify/cached', (req, res) => {
-  const cached = verificationCache.get(req.params.id);
-  if (!cached) return res.json(null);
-  res.json(cached);
-});
-
-// POST /api/backup — create backup on an instance
-app.post('/api/backup', async (req, res) => {
-  const { instanceId } = req.body;
-  const inst = loadInstances().find(i => i.id === instanceId);
-  if (!inst) return res.status(404).json({ error: 'Not found' });
+  console.log(`\n🦀 Claw Manager — Backup`);
+  console.log(`   Instance: ${inst.name} (${inst.user}@${inst.host})\n`);
 
   const logFile = path.join(LOG_DIR, `backup_${inst.id}_${Date.now()}.log`);
-  const cmd = sshCmd(inst, 'openclaw gateway stop || true; sleep 1; openclaw backup create --verify; openclaw gateway restart || true');
 
-  res.json({ started: true, logFile });
+  const stamp = () => process.stdout.write;
+  const log = (msg) => {
+    console.log(msg);
+    fs.appendFileSync(logFile, msg + '\n');
+  };
 
-  // Run in background — P0-4 FIX: catch unhandled rejection
-  runAsync(cmd, logFile).then(result => {
-    console.log(`Backup complete for ${inst.name}: exit ${result.code}`);
-  }).catch(err => console.error(`Backup async error for ${inst.name}:`, err));
-});
+  // Step 1: Create backup archive on remote
+  log('▶ Step 1/3: Creating backup archive on remote...');
+  const backupCmd = sshCmd(inst, 'openclaw backup create 2>&1');
+  const backupResult = await runAsync(backupCmd, logFile);
 
-// POST /api/transfer — backup source instance and transfer to this machine
-app.post('/api/transfer', async (req, res) => {
-  const { sourceId, destId } = req.body;
-  const source = loadInstances().find(i => i.id === sourceId);
-  const dest = loadInstances().find(i => i.id === destId) || loadInstances().find(i => i.host === 'localhost');
-  if (!source) return res.status(404).json({ error: 'Source not found' });
+  if (backupResult.code !== 0) {
+    log(`❌ Backup command failed (exit ${backupResult.code})`);
+    log(backupResult.stderr || backupResult.stdout);
+    process.exit(1);
+  }
 
-  const logFile = path.join(LOG_DIR, `transfer_${sourceId}_${Date.now()}.log`);
-  const log = (msg) => { rotateLogIfNeeded(logFile); fs.appendFileSync(logFile, msg + '\n'); };
+  // Parse archive path from output
+  const archiveMatch = backupResult.stdout.match(/Backup archive:\s*(.+\.tar\.gz)/) ||
+                       backupResult.stdout.match(/([^\s\n]+\.tar\.gz)/);
+  if (!archiveMatch) {
+    log('❌ Could not find archive path in backup output:');
+    log(backupResult.stdout.slice(0, 500));
+    process.exit(1);
+  }
 
-  res.json({ started: true, logFile: path.basename(logFile) });
+  const remotePath = archiveMatch[1].trim();
+  const filename = path.basename(remotePath);
+  const localPath = path.join(BACKUP_DIR, filename);
+  log(`   ✓ Archive created: ${remotePath}`);
 
-  // P0-4 FIX: wrap all post-response async work in try/catch to avoid unhandled rejections
-  try {
-    // Step 1: Create backup on source
-    log('=== Step 1: Creating backup on source ===');
-    const backupCmd = sshCmd(source,
-      'openclaw gateway stop || true; sleep 1; openclaw backup create --verify 2>&1'
-    );
-    const backupResult = await runAsync(backupCmd, logFile);
+  // Step 2: SCP to ~/backups/
+  log(`▶ Step 2/3: Transferring ${filename} → ${BACKUP_DIR}/...`);
+  let scpCmd;
+  if (inst.host === 'localhost' || inst.host === '127.0.0.1') {
+    scpCmd = `cp "${remotePath}" "${localPath}"`;
+  } else {
+    const key = inst.ssh_key ? `-i ${expandHome(inst.ssh_key)}` : '';
+    scpCmd = `scp -o StrictHostKeyChecking=no ${key} ${inst.user}@${inst.host}:"${remotePath}" "${localPath}"`;
+  }
 
-    // Extract archive path from output
-    const match = backupResult.stdout.match(/Backup archive: (.+\.tar\.gz)/);
-    if (!match) {
-      log('ERROR: Could not find backup archive path in output');
-      log(backupResult.stdout);
-      log(backupResult.stderr);
-      return;
+  const scpResult = await runAsync(scpCmd, logFile);
+  if (scpResult.code !== 0) {
+    log('❌ Transfer failed:');
+    log(scpResult.stderr);
+    process.exit(1);
+  }
+  log(`   ✓ Transfer complete`);
+
+  // Step 3: Confirm
+  log('▶ Step 3/3: Confirming archive...');
+  const stat = fs.statSync(localPath);
+  const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
+
+  log(`\n✅ Backup complete!`);
+  log(`   Archive: ${localPath}`);
+  log(`   Size:    ${sizeMB} MB`);
+  log(`   Log:     ${logFile}\n`);
+  process.exit(0);
+}
+
+// ── CLI dispatch ─────────────────────────────────────────────
+if (CLI_MODE) {
+  if (args.includes('--list-backups')) {
+    cliListBackups().catch(e => { console.error('Error:', e.message); process.exit(1); });
+  } else if (args.includes('--backup')) {
+    const idx = args.indexOf('--backup');
+    const query = args[idx + 1];
+    if (!query) {
+      console.error('Usage: node server.js --backup <instance-id-or-name>');
+      process.exit(1);
     }
+    cliBackup(query).catch(e => { console.error('Error:', e.message); process.exit(1); });
+  }
+} else {
+  startWebServer();
+}
 
-    const remotePath = match[1].trim();
-    const filename = path.basename(remotePath);
-    const localPath = path.join(BACKUP_DIR, filename);
+// ── Web server ────────────────────────────────────────────────
+function startWebServer() {
+  const app = express();
+  app.use(express.json());
 
-    log(`\n=== Step 2: Transferring ${filename} ===`);
+  // Auth middleware
+  if (!CLAW_MANAGER_TOKEN) {
+    console.warn('⚠️  CLAW_MANAGER_TOKEN not set — running in dev mode (no auth)');
+  }
 
-    // Step 2: SCP to this machine
-    let scpCmd;
-    if (source.host === 'localhost') {
-      scpCmd = `cp "${remotePath}" "${localPath}"`;
-    } else {
-      const key = source.ssh_key ? `-i ${expandHome(source.ssh_key)}` : '';
-      scpCmd = `scp -o StrictHostKeyChecking=no ${key} ${source.user}@${source.host}:"${remotePath}" "${localPath}"`;
+  app.use('/api', (req, res, next) => {
+    if (!CLAW_MANAGER_TOKEN) return next();
+    const auth = req.headers['authorization'] || '';
+    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
+    if (token !== CLAW_MANAGER_TOKEN) {
+      return res.status(401).json({ error: 'Unauthorized' });
     }
+    next();
+  });
 
-    const scpResult = await runAsync(scpCmd, logFile);
-    if (scpResult.code !== 0) {
-      log('ERROR: SCP failed');
-      return;
-    }
-    log(`Transfer complete: ${localPath}`);
+  // ── API Routes ─────────────────────────────────────────────
 
-    // Restart source gateway
-    const restartCmd = sshCmd(source, 'openclaw gateway restart || true');
-    await runAsync(restartCmd, logFile);
+  // GET /api/instances
+  app.get('/api/instances', (req, res) => {
+    res.json(loadInstances());
+  });
 
-    log('\n=== Transfer complete ===');
-    log(`Archive ready at: ${localPath}`);
-    log(`To restore: bash ${SCRIPTS_DIR}/rehydrate.sh "${localPath}" ${source.user} ${dest ? dest.user : os.userInfo().username}`);
+  // POST /api/instances
+  app.post('/api/instances', (req, res) => {
+    const instances = loadInstances();
+    const inst = { id: Date.now().toString(), ...req.body };
+    instances.push(inst);
+    saveInstances(instances);
+    res.json(inst);
+  });
 
-    // If dest is localhost, optionally surface a note about running verification after restore
-    const localInstForVerify = loadInstances().find(i => i.host === 'localhost' || i.host === '127.0.0.1');
-    if (localInstForVerify) {
-      log('\nTip: After restoring, use /api/instances/' + localInstForVerify.id + '/verify to check restore health.');
-    }
-  } catch (err) {
-    console.error('Transfer async error:', err);
-    log(`\nFATAL ERROR: ${err.message}`);
-  }
-});
+  // DELETE /api/instances/:id
+  app.delete('/api/instances/:id', (req, res) => {
+    const instances = loadInstances().filter(i => i.id !== req.params.id);
+    saveInstances(instances);
+    res.json({ ok: true });
+  });
 
-// POST /api/restore — run rehydrate.sh on this machine
-// P0-2 FIX: Validate oldUser/newUser against safe username pattern; validate archivePath is inside BACKUP_DIR
-const SAFE_USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+  // POST /api/backup — trigger backup creation on an instance
+  app.post('/api/backup', async (req, res) => {
+    const { instanceId } = req.body;
+    const inst = loadInstances().find(i => i.id === instanceId);
+    if (!inst) return res.status(404).json({ error: 'Not found' });
 
-app.post('/api/restore', async (req, res) => {
-  const { archivePath, oldUser, newUser } = req.body;
+    const logFile = path.join(LOG_DIR, `backup_${inst.id}_${Date.now()}.log`);
+    const cmd = sshCmd(inst, 'openclaw backup create 2>&1');
 
-  // Validate username fields to prevent command injection
-  const resolvedOldUser = oldUser || 'openclaw';
-  const resolvedNewUser = newUser || os.userInfo().username;
-  if (!SAFE_USERNAME_RE.test(resolvedOldUser)) {
-    return res.status(400).json({ error: `Invalid oldUser: ${resolvedOldUser}` });
-  }
-  if (!SAFE_USERNAME_RE.test(resolvedNewUser)) {
-    return res.status(400).json({ error: `Invalid newUser: ${resolvedNewUser}` });
-  }
+    res.json({ started: true, logFile: path.basename(logFile) });
 
-  // Validate archivePath: must be a string, end with .tar.gz, and live inside BACKUP_DIR
-  if (!archivePath || typeof archivePath !== 'string') {
-    return res.status(400).json({ error: 'archivePath is required' });
-  }
-  const resolvedArchive = path.resolve(archivePath);
-  if (!resolvedArchive.startsWith(BACKUP_DIR + path.sep) && resolvedArchive !== BACKUP_DIR) {
-    return res.status(400).json({ error: 'archivePath must be inside the backup directory' });
-  }
-  if (!resolvedArchive.endsWith('.tar.gz')) {
-    return res.status(400).json({ error: 'archivePath must be a .tar.gz file' });
-  }
-  if (!fs.existsSync(resolvedArchive)) {
-    return res.status(400).json({ error: `Archive not found: ${resolvedArchive}` });
-  }
+    runAsync(cmd, logFile).then(result => {
+      console.log(`Backup complete for ${inst.name}: exit ${result.code}`);
+    }).catch(err => console.error(`Backup async error for ${inst.name}:`, err));
+  });
 
-  const rehydrateScript = path.join(SCRIPTS_DIR, 'rehydrate.sh');
-  if (!fs.existsSync(rehydrateScript)) {
-    return res.status(500).json({ error: 'rehydrate.sh not found in scripts/' });
-  }
+  // POST /api/transfer — backup remote instance and SCP to ~/backups/
+  app.post('/api/transfer', async (req, res) => {
+    const { sourceId } = req.body;
+    const source = loadInstances().find(i => i.id === sourceId);
+    if (!source) return res.status(404).json({ error: 'Source not found' });
 
-  const logFile = path.join(LOG_DIR, `restore_${Date.now()}.log`);
-  // Safe: all three arguments are validated above
-  const cmd = `bash "${rehydrateScript}" "${resolvedArchive}" "${resolvedOldUser}" "${resolvedNewUser}"`;
+    const logFile = path.join(LOG_DIR, `transfer_${sourceId}_${Date.now()}.log`);
+    const log = (msg) => { rotateLogIfNeeded(logFile); fs.appendFileSync(logFile, msg + '\n'); };
 
-  // Find localhost instance for post-restore verification
-  const localInst = loadInstances().find(i => i.host === 'localhost' || i.host === '127.0.0.1');
+    res.json({ started: true, logFile: path.basename(logFile) });
 
-  res.json({ started: true, logFile: path.basename(logFile) });
-  // P0-4 FIX: catch unhandled rejection on fire-and-forget chain
-  runAsync(cmd, logFile).then(async r => {
-    console.log(`Restore done: exit ${r.code}`);
-    if (localInst) {
-      try {
-        fs.appendFileSync(logFile, '\n=== Post-Restore Verification ===\n');
-        const vr = await runVerification(localInst);
-        const missing = vr.checks.filter(c => c.status !== 'ok').map(c => c.name);
-        fs.appendFileSync(logFile, `Restore health: ${vr.passing}/${vr.total} checks passing.\n`);
-        if (missing.length) {
-          fs.appendFileSync(logFile, `Missing/Warn: ${missing.join(', ')}\n`);
-        } else {
-          fs.appendFileSync(logFile, 'All checks passed ✓\n');
-        }
-      } catch (e) {
-        fs.appendFileSync(logFile, `Verification error: ${e.message}\n`);
+    try {
+      log('=== Step 1: Creating backup on source ===');
+      const backupCmd = sshCmd(source, 'openclaw backup create 2>&1');
+      const backupResult = await runAsync(backupCmd, logFile);
+
+      const archiveMatch = backupResult.stdout.match(/Backup archive:\s*(.+\.tar\.gz)/) ||
+                           backupResult.stdout.match(/([^\s\n]+\.tar\.gz)/);
+      if (!archiveMatch) {
+        log('ERROR: Could not find backup archive path in output');
+        log(backupResult.stdout);
+        log(backupResult.stderr);
+        return;
       }
+
+      const remotePath = archiveMatch[1].trim();
+      const filename = path.basename(remotePath);
+      const localPath = path.join(BACKUP_DIR, filename);
+
+      log(`\n=== Step 2: Transferring ${filename} ===`);
+
+      let scpCmd;
+      if (source.host === 'localhost' || source.host === '127.0.0.1') {
+        scpCmd = `cp "${remotePath}" "${localPath}"`;
+      } else {
+        const key = source.ssh_key ? `-i ${expandHome(source.ssh_key)}` : '';
+        scpCmd = `scp -o StrictHostKeyChecking=no ${key} ${source.user}@${source.host}:"${remotePath}" "${localPath}"`;
+      }
+
+      const scpResult = await runAsync(scpCmd, logFile);
+      if (scpResult.code !== 0) {
+        log('ERROR: SCP failed');
+        log(scpResult.stderr);
+        return;
+      }
+
+      const stat = fs.statSync(localPath);
+      log(`Transfer complete: ${localPath}`);
+      log(`Size: ${(stat.size / 1024 / 1024).toFixed(1)} MB`);
+      log('\n=== Transfer complete ===');
+      log(`Archive ready at: ${localPath}`);
+    } catch (err) {
+      console.error('Transfer async error:', err);
+      log(`\nFATAL ERROR: ${err.message}`);
     }
-  }).catch(err => console.error('Restore async error:', err));
-});
+  });
 
-// GET /api/backups — list backup archives on this machine
-app.get('/api/backups', (req, res) => {
-  try {
-    const files = fs.readdirSync(BACKUP_DIR)
-      .filter(f => f.endsWith('-openclaw-backup.tar.gz'))
+  // POST /api/restore — run rehydrate.sh with archive
+  const SAFE_USERNAME_RE = /^[a-z_][a-z0-9_-]{0,31}$/;
+
+  app.post('/api/restore', async (req, res) => {
+    const { archivePath, oldUser, newUser } = req.body;
+
+    const resolvedOldUser = oldUser || 'openclaw';
+    const resolvedNewUser = newUser || os.userInfo().username;
+
+    if (!SAFE_USERNAME_RE.test(resolvedOldUser)) {
+      return res.status(400).json({ error: `Invalid oldUser: ${resolvedOldUser}` });
+    }
+    if (!SAFE_USERNAME_RE.test(resolvedNewUser)) {
+      return res.status(400).json({ error: `Invalid newUser: ${resolvedNewUser}` });
+    }
+    if (!archivePath || typeof archivePath !== 'string') {
+      return res.status(400).json({ error: 'archivePath is required' });
+    }
+
+    const resolvedArchive = path.resolve(archivePath);
+    if (!resolvedArchive.startsWith(BACKUP_DIR + path.sep) && resolvedArchive !== BACKUP_DIR) {
+      return res.status(400).json({ error: 'archivePath must be inside the backup directory' });
+    }
+    if (!resolvedArchive.endsWith('.tar.gz')) {
+      return res.status(400).json({ error: 'archivePath must be a .tar.gz file' });
+    }
+    if (!fs.existsSync(resolvedArchive)) {
+      return res.status(400).json({ error: `Archive not found: ${resolvedArchive}` });
+    }
+
+    const rehydrateScript = path.join(SCRIPTS_DIR, 'rehydrate.sh');
+    if (!fs.existsSync(rehydrateScript)) {
+      return res.status(500).json({ error: 'rehydrate.sh not found in scripts/' });
+    }
+
+    const logFile = path.join(LOG_DIR, `restore_${Date.now()}.log`);
+    const cmd = `bash "${rehydrateScript}" "${resolvedArchive}" "${resolvedOldUser}" "${resolvedNewUser}"`;
+
+    res.json({ started: true, logFile: path.basename(logFile) });
+
+    runAsync(cmd, logFile).then(r => {
+      console.log(`Restore done: exit ${r.code}`);
+    }).catch(err => console.error('Restore async error:', err));
+  });
+
+  // GET /api/backups — list archives in ~/backups/
+  app.get('/api/backups', (req, res) => {
+    try {
+      const files = fs.readdirSync(BACKUP_DIR)
+        .filter(f => f.endsWith('.tar.gz'))
+        .map(f => {
+          const full = path.join(BACKUP_DIR, f);
+          const stat = fs.statSync(full);
+          return { name: f, path: full, size: stat.size, mtime: stat.mtime };
+        })
+        .sort((a, b) => b.mtime - a.mtime);
+      res.json(files);
+    } catch (e) {
+      res.json([]);
+    }
+  });
+
+  // GET /api/logs/:file
+  app.get('/api/logs/:file', (req, res) => {
+    const safeName = path.basename(req.params.file);
+    const logFile = path.join(LOG_DIR, safeName);
+    if (!logFile.startsWith(LOG_DIR + path.sep) && logFile !== LOG_DIR) {
+      return res.status(400).json({ error: 'Invalid log file path' });
+    }
+    if (!fs.existsSync(logFile)) return res.status(404).json({ error: 'Not found' });
+    const content = fs.readFileSync(logFile, 'utf8');
+    res.type('text/plain').send(content);
+  });
+
+  // GET /api/logs
+  app.get('/api/logs', (req, res) => {
+    const files = fs.readdirSync(LOG_DIR)
+      .filter(f => f.endsWith('.log'))
       .map(f => {
-        const full = path.join(BACKUP_DIR, f);
-        const stat = fs.statSync(full);
-        return { name: f, path: full, size: stat.size, mtime: stat.mtime };
+        const stat = fs.statSync(path.join(LOG_DIR, f));
+        return { name: f, size: stat.size, mtime: stat.mtime };
       })
-      .sort((a, b) => b.mtime - a.mtime);
+      .sort((a, b) => b.mtime - a.mtime)
+      .slice(0, 20);
     res.json(files);
-  } catch (e) {
-    res.json([]);
-  }
-});
+  });
 
-// GET /api/logs/:file — tail a log file
-// P0-1 FIX: Use path.basename() to prevent path traversal; verify resolved path is inside LOG_DIR
-app.get('/api/logs/:file', (req, res) => {
-  const safeName = path.basename(req.params.file);
-  const logFile = path.join(LOG_DIR, safeName);
-  // Double-check resolved path is still inside LOG_DIR (defence-in-depth)
-  if (!logFile.startsWith(LOG_DIR + path.sep) && logFile !== LOG_DIR) {
-    return res.status(400).json({ error: 'Invalid log file path' });
-  }
-  if (!fs.existsSync(logFile)) return res.status(404).json({ error: 'Not found' });
-  const content = fs.readFileSync(logFile, 'utf8');
-  res.type('text/plain').send(content);
-});
+  // Frontend
+  app.get('/', (req, res) => res.send(HTML));
 
-// GET /api/logs — list log files
-app.get('/api/logs', (req, res) => {
-  const files = fs.readdirSync(LOG_DIR)
-    .filter(f => f.endsWith('.log'))
-    .map(f => {
-      const stat = fs.statSync(path.join(LOG_DIR, f));
-      return { name: f, size: stat.size, mtime: stat.mtime };
-    })
-    .sort((a, b) => b.mtime - a.mtime)
-    .slice(0, 20);
-  res.json(files);
-});
+  app.listen(PORT, '192.168.50.84', () => {
+    console.log(`🦀 Claw Manager — Backup Tool`);
+    console.log(`   Web UI: http://192.168.50.84:${PORT}`);
+    console.log(`   CLI:    node server.js --backup <id>  |  node server.js --list-backups`);
+  });
+}
 
-// ── Frontend ─────────────────────────────────────────────────
-app.get('/', (req, res) => {
-  res.send(HTML);
-});
-
-// ── Start ────────────────────────────────────────────────────
-app.listen(PORT, '192.168.50.84', () => {
-  console.log(`🦀 Claw Manager running at http://192.168.50.84:${PORT}`);
-});
-
-// ── HTML (single-file frontend) ──────────────────────────────
+// ── HTML frontend ─────────────────────────────────────────────
 const HTML = `<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -513,21 +482,14 @@ const HTML = `<!DOCTYPE html>
   .section-title { font-size: 0.75rem; color: #666; text-transform: uppercase; letter-spacing: 0.05em; margin-bottom: 6px; }
   .spinner { display: inline-block; width: 14px; height: 14px; border: 2px solid #444; border-top-color: #c0392b; border-radius: 50%; animation: spin 0.7s linear infinite; }
   @keyframes spin { to { transform: rotate(360deg); } }
-  .status-row { font-size: 0.8rem; color: #888; margin-top: 6px; }
   .full-width { grid-column: 1 / -1; }
-  .check-row { display: flex; align-items: center; gap: 10px; padding: 7px 10px; background: #111; border-radius: 5px; margin-bottom: 5px; font-size: 0.85rem; }
-  .check-name { flex: 1; color: #ccc; }
-  .check-detail { color: #666; font-size: 0.8rem; flex: 2; }
-  .badge-ok { background: #1a4a1a; color: #4caf50; }
-  .badge-warn { background: #4a3a00; color: #ffc107; }
-  .badge-error { background: #4a1a1a; color: #f44336; }
 </style>
 </head>
 <body>
 <header>
   <span style="font-size:1.6rem">🦀</span>
   <h1>Claw Manager</h1>
-  <span>OpenClaw Instance Manager</span>
+  <span>Backup Tool</span>
 </header>
 <div class="container">
   <div class="grid">
@@ -554,7 +516,7 @@ const HTML = `<!DOCTYPE html>
       <button class="btn btn-primary" onclick="createBackup()">▶ Create Backup</button>
 
       <div style="margin-top:16px; border-top:1px solid #2a2a2a; padding-top:14px;">
-        <div class="section-title">Transfer (Backup Source → This Machine)</div>
+        <div class="section-title">Transfer (Backup Source → This Machine ~/backups/)</div>
         <select id="transfer-source"></select>
         <button class="btn btn-success" onclick="transferBackup()">⬇ Backup + Transfer Here</button>
       </div>
@@ -565,7 +527,7 @@ const HTML = `<!DOCTYPE html>
     <!-- Restore -->
     <div class="card">
       <h2>🔄 Restore</h2>
-      <div class="section-title">Available Backups (this machine)</div>
+      <div class="section-title">Available Backups (~/backups/)</div>
       <ul class="backup-list" id="backup-files">Loading...</ul>
 
       <div style="margin-top:14px; border-top:1px solid #2a2a2a; padding-top:14px;">
@@ -587,26 +549,6 @@ const HTML = `<!DOCTYPE html>
         <option value="">— select a log —</option>
       </select>
       <div id="log-content" class="log-area hidden"></div>
-    </div>
-
-    <!-- Cron Jobs (full width) -->
-    <div class="card full-width">
-      <h2>⏰ Cron Jobs</h2>
-      <select id="cron-instance" style="max-width:300px; display:inline-block; margin-right:8px;"></select>
-      <button class="btn btn-secondary" onclick="loadCrons()">Refresh</button>
-      <div id="cron-output" class="log-area hidden" style="margin-top:12px; max-height:400px;"></div>
-    </div>
-
-    <!-- Instance Health (full width) -->
-    <div class="card full-width">
-      <h2>🏥 Instance Health</h2>
-      <div style="display:flex; align-items:center; gap:10px; flex-wrap:wrap; margin-bottom:14px;">
-        <select id="health-instance" style="max-width:300px; display:inline-block; margin-bottom:0;" onchange="loadCachedHealth()"></select>
-        <button class="btn btn-primary" onclick="runVerification()" id="verify-btn">▶ Run Verification</button>
-        <span id="health-last-verified" style="font-size:0.78rem; color:#666;"></span>
-      </div>
-      <div id="health-score" style="margin-bottom:12px; font-size:0.9rem; color:#aaa;"></div>
-      <div id="health-checks"></div>
     </div>
 
   </div>
@@ -638,7 +580,10 @@ async function loadInstances() {
 
 function renderInstances() {
   const el = document.getElementById('instances-list');
-  if (!instances.length) { el.innerHTML = '<p style="color:#666;font-size:0.85rem">No instances configured.</p>'; return; }
+  if (!instances.length) {
+    el.innerHTML = '<p style="color:#666;font-size:0.85rem">No instances configured.</p>';
+    return;
+  }
   el.innerHTML = instances.map(inst => \`
     <div class="instance">
       <div class="instance-header">
@@ -646,45 +591,31 @@ function renderInstances() {
           <div class="instance-name">\${htmlEscape(inst.name)}</div>
           <div class="instance-host">\${htmlEscape(inst.user)}@\${htmlEscape(inst.host)}</div>
         </div>
-        <span class="badge badge-gray" id="status-\${htmlEscape(inst.id)}">?</span>
       </div>
       <div class="btn-row">
-        <button class="btn btn-secondary" onclick="checkStatus('\${htmlEscape(inst.id)}')">🔍 Status</button>
         <button class="btn btn-secondary" onclick="removeInstance('\${htmlEscape(inst.id)}')">🗑 Remove</button>
       </div>
-      <div class="status-row" id="status-out-\${htmlEscape(inst.id)}"></div>
     </div>
   \`).join('');
 }
 
 function populateSelects() {
-  const selects = ['backup-source', 'transfer-source', 'cron-instance'];
-  selects.forEach(id => {
+  ['backup-source', 'transfer-source'].forEach(id => {
     const el = document.getElementById(id);
     el.innerHTML = instances.map(i => \`<option value="\${htmlEscape(i.id)}">\${htmlEscape(i.name)}</option>\`).join('');
   });
-  populateHealthSelect();
-}
-
-async function checkStatus(id) {
-  const badge = document.getElementById('status-' + id);
-  const out = document.getElementById('status-out-' + id);
-  badge.innerHTML = '<span class="spinner"></span>';
-  const result = await api('/instances/' + id + '/status');
-  badge.className = 'badge ' + (result.online ? 'badge-green' : 'badge-red');
-  badge.textContent = result.online ? 'online' : 'offline';
-  out.textContent = result.output?.slice(0, 200) || '';
 }
 
 async function addInstance() {
+  const user = document.getElementById('add-user').value;
   const inst = {
     name: document.getElementById('add-name').value,
     host: document.getElementById('add-host').value,
-    user: document.getElementById('add-user').value,
+    user,
     ssh_key: document.getElementById('add-key').value || null,
-    openclaw_state: '/home/' + document.getElementById('add-user').value + '/.openclaw',
-    workspace: '/home/' + document.getElementById('add-user').value + '/.openclaw/workspace',
-    backup_dir: '/home/' + document.getElementById('add-user').value,
+    openclaw_state: '/home/' + user + '/.openclaw',
+    workspace: '/home/' + user + '/.openclaw/workspace',
+    backup_dir: '/home/' + user + '/backups',
   };
   await api('/instances', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify(inst) });
   loadInstances();
@@ -701,9 +632,27 @@ async function createBackup() {
   const log = document.getElementById('backup-log');
   log.classList.remove('hidden');
   log.textContent = 'Starting backup...\\n';
-  const result = await api('/backup', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ instanceId }) });
-  log.textContent += result.started ? 'Backup started in background. Check logs for progress.\\n' : 'Error starting backup.\\n';
-  setTimeout(loadLogs, 2000);
+  const result = await api('/backup', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ instanceId })
+  });
+  if (result.started) {
+    log.textContent += \`Backup running. Log: \${result.logFile}\\nPolling for updates...\\n\`;
+    let attempts = 0;
+    const poll = setInterval(async () => {
+      attempts++;
+      const content = await apiText('/logs/' + result.logFile);
+      log.textContent = content;
+      log.scrollTop = log.scrollHeight;
+      if (content.includes('[exit 0]') || content.includes('[exit 1]') || attempts > 60) {
+        clearInterval(poll);
+        loadLogs();
+      }
+    }, 3000);
+  } else {
+    log.textContent += 'Error: ' + (result.error || 'unknown');
+  }
 }
 
 async function transferBackup() {
@@ -711,7 +660,11 @@ async function transferBackup() {
   const log = document.getElementById('backup-log');
   log.classList.remove('hidden');
   log.textContent = 'Starting backup + transfer...\\n';
-  const result = await api('/transfer', { method: 'POST', headers: {'Content-Type':'application/json'}, body: JSON.stringify({ sourceId }) });
+  const result = await api('/transfer', {
+    method: 'POST',
+    headers: {'Content-Type':'application/json'},
+    body: JSON.stringify({ sourceId })
+  });
   if (result.started) {
     log.textContent += \`Transfer running. Log: \${result.logFile}\\nPolling for updates...\\n\`;
     let attempts = 0;
@@ -723,6 +676,7 @@ async function transferBackup() {
       if (content.includes('Transfer complete') || content.includes('ERROR') || attempts > 60) {
         clearInterval(poll);
         loadBackupFiles();
+        loadLogs();
       }
     }, 3000);
   }
@@ -739,11 +693,12 @@ async function loadBackupFiles() {
   }
   ul.innerHTML = files.map(f => \`
     <li>
-      <span class="backup-name">\${f.name}<span class="backup-size">(\${(f.size/1024/1024).toFixed(1)}MB)</span></span>
-      <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.75rem" onclick="document.getElementById('restore-backup').value='\${f.path}'">Use</button>
+      <span class="backup-name">\${htmlEscape(f.name)}<span class="backup-size">(\${(f.size/1024/1024).toFixed(1)}MB)</span></span>
+      <button class="btn btn-secondary" style="padding:4px 10px;font-size:0.75rem"
+        onclick="document.getElementById('restore-backup').value='\${htmlEscape(f.path)}'">Use</button>
     </li>
   \`).join('');
-  sel.innerHTML = files.map(f => \`<option value="\${f.path}">\${f.name}</option>\`).join('');
+  sel.innerHTML = files.map(f => \`<option value="\${htmlEscape(f.path)}">\${htmlEscape(f.name)}</option>\`).join('');
 }
 
 async function doRestore() {
@@ -772,6 +727,7 @@ async function doRestore() {
       log.scrollTop = log.scrollHeight;
       if (content.includes('Rehydration complete') || content.includes('ERROR') || attempts > 120) {
         clearInterval(poll);
+        loadLogs();
       }
     }, 3000);
   } else {
@@ -779,21 +735,12 @@ async function doRestore() {
   }
 }
 
-async function loadCrons() {
-  const instanceId = document.getElementById('cron-instance').value;
-  const out = document.getElementById('cron-output');
-  out.classList.remove('hidden');
-  out.textContent = 'Loading...';
-  const result = await api('/instances/' + instanceId + '/crons');
-  out.textContent = result.output || 'No output';
-}
-
 async function loadLogs() {
   const files = await api('/logs');
   const sel = document.getElementById('log-select');
   const current = sel.value;
   sel.innerHTML = '<option value="">— select a log —</option>' +
-    files.map(f => \`<option value="\${f.name}" \${f.name===current?'selected':''}>\${f.name} (\${(f.size/1024).toFixed(1)}KB)</option>\`).join('');
+    files.map(f => \`<option value="\${htmlEscape(f.name)}" \${f.name===current?'selected':''}>\${htmlEscape(f.name)} (\${(f.size/1024).toFixed(1)}KB)</option>\`).join('');
 }
 
 async function loadLog() {
@@ -803,61 +750,6 @@ async function loadLog() {
   el.classList.remove('hidden');
   el.textContent = await apiText('/logs/' + file);
   el.scrollTop = el.scrollHeight;
-}
-
-async function runVerification() {
-  const instanceId = document.getElementById('health-instance').value;
-  if (!instanceId) return;
-  const btn = document.getElementById('verify-btn');
-  btn.disabled = true;
-  btn.innerHTML = '<span class="spinner"></span> Running...';
-  document.getElementById('health-score').textContent = 'Running verification...';
-  document.getElementById('health-checks').innerHTML = '';
-  document.getElementById('health-last-verified').textContent = '';
-
-  try {
-    const result = await api('/instances/' + instanceId + '/verify');
-    renderHealthResult(result);
-  } catch (e) {
-    document.getElementById('health-score').textContent = 'Error: ' + e.message;
-  } finally {
-    btn.disabled = false;
-    btn.textContent = '▶ Run Verification';
-  }
-}
-
-async function loadCachedHealth() {
-  const instanceId = document.getElementById('health-instance').value;
-  if (!instanceId) return;
-  const result = await api('/instances/' + instanceId + '/verify/cached');
-  if (result) renderHealthResult(result);
-}
-
-function renderHealthResult(result) {
-  const scoreEl = document.getElementById('health-score');
-  const checksEl = document.getElementById('health-checks');
-  const lastEl = document.getElementById('health-last-verified');
-
-  const score = result.passing + '/' + result.total + ' checks passing';
-  const color = result.passing === result.total ? '#4caf50' : result.passing >= result.total * 0.75 ? '#ffc107' : '#f44336';
-  scoreEl.innerHTML = \`<strong style="color:\${color}; font-size:1.1rem;">\${score}</strong>\`;
-
-  checksEl.innerHTML = result.checks.map(c => \`
-    <div class="check-row">
-      <span class="badge \${c.status === 'ok' ? 'badge-ok' : c.status === 'warn' ? 'badge-warn' : 'badge-error'}">\${c.status}</span>
-      <span class="check-name">\${c.name}</span>
-      <span class="check-detail">\${c.detail || ''}</span>
-    </div>
-  \`).join('');
-
-  const ts = new Date(result.timestamp).toLocaleString();
-  lastEl.textContent = 'Last verified: ' + ts;
-}
-
-function populateHealthSelect() {
-  const el = document.getElementById('health-instance');
-  el.innerHTML = instances.map(i => \`<option value="\${htmlEscape(i.id)}">\${htmlEscape(i.name)}</option>\`).join('');
-  loadCachedHealth();
 }
 
 loadInstances();
