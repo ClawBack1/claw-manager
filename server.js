@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // ============================================================
-// Claw Manager — OpenClaw backup tool
+// ClawdBack — OpenClaw backup tool
 // Usage: node server.js [port]
 //        node server.js --backup <instance-id-or-name>
 //        node server.js --list-backups
@@ -143,7 +143,7 @@ async function cliBackup(query) {
     process.exit(1);
   }
 
-  console.log(`\n🦀 Claw Manager — Backup`);
+  console.log(`\n🦀 ClawdBack — Backup`);
   console.log(`   Instance: ${inst.name} (${inst.user}@${inst.host})\n`);
 
   const logFile = path.join(LOG_DIR, `backup_${inst.id}_${Date.now()}.log`);
@@ -433,7 +433,7 @@ function startWebServer() {
   app.get('/', (req, res) => res.send(HTML));
 
   app.listen(PORT, '192.168.50.84', () => {
-    console.log(`🦀 Claw Manager — Backup Tool`);
+    console.log(`🦀 ClawdBack — Backup Tool`);
     console.log(`   Web UI: http://192.168.50.84:${PORT}`);
     console.log(`   CLI:    node server.js --backup <id>  |  node server.js --list-backups`);
   });
@@ -445,7 +445,7 @@ const HTML = `<!DOCTYPE html>
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>🦀 Claw Manager</title>
+<title>🦀 ClawdBack</title>
 <style>
   * { box-sizing: border-box; margin: 0; padding: 0; }
   body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; background: #0d0d0d; color: #e0e0e0; min-height: 100vh; }
@@ -488,7 +488,7 @@ const HTML = `<!DOCTYPE html>
 <body>
 <header>
   <span style="font-size:1.6rem">🦀</span>
-  <h1>Claw Manager</h1>
+  <h1>ClawdBack</h1>
   <span>Backup Tool</span>
 </header>
 <div class="container">

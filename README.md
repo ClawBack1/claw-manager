@@ -1,4 +1,4 @@
-# 🦀 Claw Manager
+# 🦀 ClawdBack
 
 A purpose-built backup tool for OpenClaw instances — lightweight Node.js web UI + one-command CLI for backing up, transferring, and restoring OpenClaw instances across machines.
 

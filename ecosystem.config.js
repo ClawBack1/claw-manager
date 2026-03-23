@@ -1,6 +1,6 @@
 module.exports = {
   apps: [{
-    name: 'claw-manager',
+    name: 'clawdback',
     script: 'server.js',
     env: {
       PORT: 7788,
