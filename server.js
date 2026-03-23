@@ -18,7 +18,6 @@ const args = process.argv.slice(2);
 const CLI_MODE = args.includes('--backup') || args.includes('--list-backups');
 
 const PORT = process.env.PORT || (!CLI_MODE && args[0] && !args[0].startsWith('--') ? args[0] : 7788);
-const CLAW_MANAGER_TOKEN = process.env.CLAW_MANAGER_TOKEN || null;
 const INSTANCES_FILE = path.join(__dirname, 'instances.json');
 const SCRIPTS_DIR = path.join(os.homedir(), '.openclaw/workspace/scripts');
 const BACKUP_DIR = path.join(os.homedir(), 'backups');
@@ -231,21 +230,6 @@ function startWebServer() {
   const app = express();
   app.use(express.json());
 
-  // Auth middleware
-  if (!CLAW_MANAGER_TOKEN) {
-    console.warn('⚠️  CLAW_MANAGER_TOKEN not set — running in dev mode (no auth)');
-  }
-
-  app.use('/api', (req, res, next) => {
-    if (!CLAW_MANAGER_TOKEN) return next();
-    const auth = req.headers['authorization'] || '';
-    const token = auth.startsWith('Bearer ') ? auth.slice(7) : '';
-    if (token !== CLAW_MANAGER_TOKEN) {
-      return res.status(401).json({ error: 'Unauthorized' });
-    }
-    next();
-  });
-
   // ── API Routes ─────────────────────────────────────────────
 
   // GET /api/instances
@@ -432,10 +416,8 @@ function startWebServer() {
   // Frontend
   app.get('/', (req, res) => res.send(HTML));
 
-  app.listen(PORT, '192.168.50.84', () => {
-    console.log(`🦀 ClawdBack — Backup Tool`);
-    console.log(`   Web UI: http://192.168.50.84:${PORT}`);
-    console.log(`   CLI:    node server.js --backup <id>  |  node server.js --list-backups`);
+  app.listen(PORT, '0.0.0.0', () => {
+    console.log(`🦀 ClawdBack running at http://0.0.0.0:${PORT} — open in browser or use CLI`);
   });
 }
 
