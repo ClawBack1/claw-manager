@@ -147,7 +147,6 @@ async function cliBackup(query) {
 
   const logFile = path.join(LOG_DIR, `backup_${inst.id}_${Date.now()}.log`);
 
-  const stamp = () => process.stdout.write;
   const log = (msg) => {
     console.log(msg);
     fs.appendFileSync(logFile, msg + '\n');
@@ -188,6 +187,18 @@ async function cliBackup(query) {
     scpCmd = `scp -o StrictHostKeyChecking=no ${key} ${inst.user}@${inst.host}:"${remotePath}" "${localPath}"`;
   }
 
+  // Check available disk space before transfer
+  const sizeCheckCmd = sshCmd(inst, `stat -c%s "${remotePath}"`);
+  const sizeResult = await runAsync(sizeCheckCmd, logFile);
+  const remoteSize = parseInt(sizeResult.stdout.trim()) || 0;
+  const freeResult = await runAsync(`df -B1 "${BACKUP_DIR}" | tail -1 | awk '{print $4}'`, logFile);
+  const freeSpace = parseInt(freeResult.stdout.trim()) || 0;
+  if (remoteSize > 0 && freeSpace < remoteSize * 1.1) {
+    log(`❌ Insufficient disk space: need ${(remoteSize/1024/1024).toFixed(0)}MB, have ${(freeSpace/1024/1024).toFixed(0)}MB free`);
+    process.exit(1);
+  }
+  log(`   Disk space OK: ${(freeSpace/1024/1024).toFixed(0)}MB free`);
+
   const scpResult = await runAsync(scpCmd, logFile);
   if (scpResult.code !== 0) {
     log('❌ Transfer failed:');
@@ -196,8 +207,16 @@ async function cliBackup(query) {
   }
   log(`   ✓ Transfer complete`);
 
-  // Step 3: Confirm
-  log('▶ Step 3/3: Confirming archive...');
+  // Step 3: Verify archive integrity
+  log('▶ Step 3/3: Verifying archive integrity...');
+  const verifyResult = await runAsync(`tar -tzf "${localPath}" >/dev/null 2>&1 && echo OK`, logFile);
+  if (verifyResult.code !== 0) {
+    log('❌ Archive verification failed — file may be corrupt or truncated');
+    fs.unlinkSync(localPath);
+    process.exit(1);
+  }
+  log(`   ✓ Archive verified`);
+
   const stat = fs.statSync(localPath);
   const sizeMB = (stat.size / 1024 / 1024).toFixed(1);
 
@@ -308,12 +327,33 @@ function startWebServer() {
         scpCmd = `scp -o StrictHostKeyChecking=no ${key} ${source.user}@${source.host}:"${remotePath}" "${localPath}"`;
       }
 
+      // Check available disk space before transfer
+      const sizeResult = await runAsync(sshCmd(source, `stat -c%s "${remotePath}"`), logFile);
+      const remoteSize = parseInt(sizeResult.stdout.trim()) || 0;
+      const freeResult = await runAsync(`df -B1 "${BACKUP_DIR}" | tail -1 | awk '{print $4}'`, logFile);
+      const freeSpace = parseInt(freeResult.stdout.trim()) || 0;
+      if (remoteSize > 0 && freeSpace < remoteSize * 1.1) {
+        log(`ERROR: Insufficient disk space: need ${(remoteSize/1024/1024).toFixed(0)}MB, have ${(freeSpace/1024/1024).toFixed(0)}MB free`);
+        return;
+      }
+      log(`Disk space OK: ${(freeSpace/1024/1024).toFixed(0)}MB free, archive is ${(remoteSize/1024/1024).toFixed(1)}MB`);
+
       const scpResult = await runAsync(scpCmd, logFile);
       if (scpResult.code !== 0) {
         log('ERROR: SCP failed');
         log(scpResult.stderr);
         return;
       }
+
+      // Verify archive integrity after transfer
+      log('Verifying archive integrity...');
+      const verifyResult = await runAsync(`tar -tzf "${localPath}" >/dev/null 2>&1 && echo OK`, logFile);
+      if (verifyResult.code !== 0) {
+        log('ERROR: Archive verification failed — file may be corrupt or truncated');
+        fs.unlinkSync(localPath);
+        return;
+      }
+      log('✅ Archive integrity verified');
 
       const stat = fs.statSync(localPath);
       log(`Transfer complete: ${localPath}`);
