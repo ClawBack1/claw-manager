@@ -427,7 +427,15 @@ function startWebServer() {
         log('Cleaning stale sessions...');
         await runAsync(`rm -rf /home/${resolvedNewUser}/.openclaw/agents/main/sessions/*.jsonl /home/${resolvedNewUser}/.openclaw/subagents/runs.json 2>/dev/null; echo "Sessions cleaned"`, logFile);
 
-        // Step 4: Alert about channels
+        // Step 4: Fix PATH for openclaw binary
+        log('Fixing PATH for openclaw binary...');
+        await runAsync(`
+          grep -q '.npm-global/bin' /home/${resolvedNewUser}/.bashrc || echo 'export PATH=\$PATH:/home/${resolvedNewUser}/.npm-global/bin' >> /home/${resolvedNewUser}/.bashrc
+          grep -q '.npm-global/bin' /home/${resolvedNewUser}/.profile || echo 'export PATH=\$PATH:/home/${resolvedNewUser}/.npm-global/bin' >> /home/${resolvedNewUser}/.profile
+          echo "PATH fixed"
+        `, logFile);
+
+        // Step 5: Alert about channels
         log('');
         log('⚠️  IMPORTANT: Channel tokens (Telegram/Slack) were redacted from backup');
         log('   → Reconfigure them in openclaw.json before use');
