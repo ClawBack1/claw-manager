@@ -404,11 +404,43 @@ function startWebServer() {
     const logFile = path.join(LOG_DIR, `restore_${Date.now()}.log`);
     const cmd = `bash "${rehydrateScript}" "${resolvedArchive}" "${resolvedOldUser}" "${resolvedNewUser}"`;
 
+    const log = (msg) => { rotateLogIfNeeded(logFile); fs.appendFileSync(logFile, msg + '\n'); };
+
     res.json({ started: true, logFile: path.basename(logFile) });
 
-    runAsync(cmd, logFile).then(r => {
-      console.log(`Restore done: exit ${r.code}`);
-    }).catch(err => console.error('Restore async error:', err));
+    (async () => {
+      try {
+        // Step 1: Run rehydrate.sh
+        const rehydrateResult = await runAsync(cmd, logFile);
+        if (rehydrateResult.code !== 0) {
+          log('ERROR: rehydrate.sh failed');
+          return;
+        }
+
+        // Step 2: Deep path rewrite (catches anything rehydrate.sh missed)
+        log('\n=== Post-restore processing ===');
+        log('Running deep path rewrite...');
+        const rewriteCmd = `find /home/${resolvedNewUser}/.openclaw/ -type f -not -path '*/.git/*' -not -name '*.tar.gz' | xargs grep -l '/home/${resolvedOldUser}' 2>/dev/null | while read f; do sed -i 's|/home/${resolvedOldUser}|/home/${resolvedNewUser}|g' "$f"; done && echo "Path rewrite complete"`;
+        await runAsync(rewriteCmd, logFile);
+
+        // Step 3: Clean up stale sessions
+        log('Cleaning stale sessions...');
+        await runAsync(`rm -rf /home/${resolvedNewUser}/.openclaw/agents/main/sessions/*.jsonl /home/${resolvedNewUser}/.openclaw/subagents/runs.json 2>/dev/null; echo "Sessions cleaned"`, logFile);
+
+        // Step 4: Alert about channels
+        log('');
+        log('⚠️  IMPORTANT: Channel tokens (Telegram/Slack) were redacted from backup');
+        log('   → Reconfigure them in openclaw.json before use');
+        log('   → Re-pair your user ID with any new bot tokens');
+        log('');
+        log('=== Post-restore processing complete ===');
+
+        console.log(`Restore done: exit ${rehydrateResult.code}`);
+      } catch (err) {
+        console.error('Restore async error:', err);
+        log(`\nFATAL ERROR: ${err.message}`);
+      }
+    })();
   });
 
   // GET /api/backups — list archives in ~/backups/

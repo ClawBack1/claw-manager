@@ -33,12 +33,32 @@ In the **Restore** tab:
 Ctrl+C
 ```
 
+## After Restore — Required Steps
+
+1. **Channel tokens are redacted** — Telegram/Slack bot tokens are stripped from backups for security. Reconfigure them in `~/.openclaw/openclaw.json`:
+   ```json
+   "channels": {
+     "telegram": { "botToken": "YOUR_NEW_TOKEN" },
+     "slack": { "botToken": "YOUR_NEW_TOKEN", "appToken": "YOUR_NEW_APP_TOKEN" }
+   }
+   ```
+
+2. **Re-pair your user ID** — If you're using a new bot token, pair your user ID with it:
+   ```bash
+   openclaw config telegram authorize <your-user-id>
+   ```
+
+3. **Session history is cleared** — The agent starts fresh. Your workspace, memory files, crons, and identity are preserved, but conversation history from the source machine is not transferred.
+
+4. **Verify crons** — Run `openclaw cron list` to confirm your scheduled jobs survived.
+
 ## Important Notes
 
 - **Restore runs locally** — ClawdBack restores the backup onto the machine it's running on, not a remote target
 - **Archive integrity** — transfers are verified automatically. If verification fails, the archive is rejected
 - **Disk space** — ClawdBack checks available space before transferring
 - **Gateway restart** — restoring will restart the OpenClaw gateway (drops active connections briefly)
+- **Node.js 22+ required** — The target machine must have Node.js 22 or later installed
 
 ## CLI Mode
 ```bash
